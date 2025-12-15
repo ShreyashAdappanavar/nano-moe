@@ -41,7 +41,8 @@ class MoELayer(nn.Module):
         for i in self.shared_experts:
                 shared_exps_op.append(i(x))
 
-        topk = torch.topk(F.softmax(self.router(x), dim=-1), self.top_k) # .values and .indices : (batch_size, sequence_length, top_k)
+        logits = F.softmax(self.router(x), dim=-1)
+        topk = torch.topk(logits, self.top_k) # .values and .indices : (batch_size, sequence_length, top_k)
         weights = topk.values # (batch_size, sequence_length, top_k)
         indices = topk.indices # (batch_size, sequence_length, top_k)
 
@@ -56,7 +57,7 @@ class MoELayer(nn.Module):
                 routed_output += curr_expert(x) * torch.sum(cur_weights, dim=-1, keepdim=True)
                 
         final_op = sum(shared_exps_op) + routed_output
-        return final_op
+        return final_op, logits
     
 class CausalSelfAttention(nn.Module):
     def __init__(self, args: ModelArgs):
@@ -94,8 +95,8 @@ class CausalSelfAttention(nn.Module):
         self.register_buffer("cos_matrix", cos_matrix)
         self.register_buffer("sin_matrix", sin_matrix)
         self.register_buffer("causal_mask", causal_mask)
-        self.register_buffer("k_cache", k_cache)
-        self.register_buffer("v_cache", v_cache)
+        self.register_buffer("k_cache", k_cache, persistent=False)
+        self.register_buffer("v_cache", v_cache, persistent=False)
 
     def forward(self, x: torch.Tensor, start_posn: int = 0, use_kv_cache: bool = False):
         # x shape: (batch_size, curr_seq_length, d_model)
@@ -204,9 +205,10 @@ class TransformerBlock(nn.Module):
         # x shape: (batch_size, sequence_length, d_model)
 
         h = x + self.attention(self.attention_norm(x), start_posn, use_kv_cache)
-        out = h + self.feed_forward(self.ff_norm(h))
+        moe_op, router_logits = self.feed_forward(self.ff_norm(h))
+        out = h + moe_op
         
-        return out
+        return out, router_logits
 
 
 class Transformer(nn.Module):
@@ -229,9 +231,12 @@ class Transformer(nn.Module):
 
         h = self.token_embeddings(x) # (batch_size, sequence_length, d_model)
 
+        all_router_logits = []
         for layer in self.layers:
-            h = layer(h, start_posn, use_kv_cache)
+            op, router_logits = layer(h, start_posn, use_kv_cache)
+            all_router_logits.append(router_logits)
+            h = op
 
         h = self.norm(h)
         
-        return self.output(h)
+        return self.output(h), all_router_logits
