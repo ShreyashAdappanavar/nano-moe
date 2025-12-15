@@ -1,0 +1,18 @@
+from dataclasses import dataclass
+
+@dataclass
+class ModelArgs:
+    d_model: int = 256
+    hidden_dim: int = 512
+    n_layers: int = 4
+    n_heads: int = 4
+    vocab_size: int = 10_000
+    
+    num_experts: int = 8
+    num_shared_experts: int = 1
+    top_k: int = 2
+
+    n_kv_heads: int = 2
+    max_seq_len: int =  1024
+    rope_theta: float = 10_000.0
+    
