@@ -15,4 +15,10 @@ class ModelArgs:
     n_kv_heads: int = 2
     max_seq_len: int =  1024
     rope_theta: float = 10_000.0
-    
+    batch_size: int = 32
+
+    rmsnorm_eps: float = 1e-6
+
+    assert d_model%n_heads == 0
+    assert (d_model / n_heads) % 2 == 0
+    assert n_heads%n_kv_heads==0
