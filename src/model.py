@@ -36,6 +36,7 @@ class MoELayer(nn.Module):
     
     def forward(self, x: torch.Tensor):
         # x shape: (batch_size, sequence_length, d_model)
+        batch_size, sequence_length, _ = x.size()
 
         shared_exps_op = []
         for i in self.shared_experts:
@@ -48,13 +49,27 @@ class MoELayer(nn.Module):
 
         weights = weights/torch.sum(weights, dim=-1, keepdim=True)
 
-        routed_output = torch.zeros_like(x)
-        for i, curr_expert in enumerate(self.experts):
-            mask = (indices==i) # (batch_size, sequence_length, top_k)
+        x_flat = x.view(batch_size * sequence_length, self.d_model) # (batch_size * sequence_length, d_model)
+        weights = weights.view(batch_size * sequence_length, self.top_k) # (batch_size * sequence_length, top_k)
+        indices = indices.view(batch_size * sequence_length, self.top_k) # (batch_size * sequence_length, top_k)
 
-            if mask.any():
-                cur_weights = weights * mask # Now the weight of the second chosen expert will be zero after multiplying it with mask
-                routed_output += curr_expert(x) * torch.sum(cur_weights, dim=-1, keepdim=True)
+        routed_output = torch.zeros_like(x_flat) # (batch_size * sequence_length, d_model)
+
+        for i, curr_expert in enumerate(self.experts):
+            row, index = torch.where(indices==i)
+            curr_expert_ip = x_flat[row] # (selected_rows, d_model)
+            curr_expert_op = curr_expert(curr_expert_ip) # (selected_rows, d_model)
+            curr_expert_op *= weights[row, index].unsqueeze(-1)
+            routed_output[row] += curr_expert_op
+            
+        routed_output = routed_output.view(batch_size, sequence_length, self.d_model)
+
+        # for i, curr_expert in enumerate(self.experts):
+        #     mask = (indices==i) # (batch_size, sequence_length, top_k)
+
+        #     if mask.any():
+        #         cur_weights = weights * mask # Now the weight of the second chosen expert will be zero after multiplying it with mask
+        #         routed_output += curr_expert(x) * torch.sum(cur_weights, dim=-1, keepdim=True)
                 
         final_op = sum(shared_exps_op) + routed_output
         return final_op, logits
@@ -256,3 +271,35 @@ class Transformer(nn.Module):
         h = self.norm(h)
         
         return self.output(h), all_router_logits
+
+    @torch.no_grad()
+    def generate(self, idx: torch.Tensor, max_new_tokens: int, temperature: float = 1.0, use_kv_cache: bool = True):
+        # idx shape: (batch_size, sequence_length)
+        
+        prompt_len = idx.shape[1]
+
+        for _ in range(max_new_tokens):
+           
+            if use_kv_cache and idx.shape[1] > prompt_len:
+                # Fast Mode: Only feed the last generated token
+                x_input = idx[:, -1:]
+                start_posn = idx.shape[1] - 1
+            else:
+                # Full Mode: Feed everything (Prefill or No-Cache)
+                x_input = idx
+                start_posn = 0
+
+            # Forward pass
+            logits, _ = self(x_input, start_posn=start_posn, use_kv_cache=use_kv_cache)
+            
+            # Focus only on the last token's logits for prediction
+            logits = logits[:, -1, :] / temperature
+            
+            # Sample from the distribution
+            probs = F.softmax(logits, dim=-1)
+            idx_next = torch.multinomial(probs, num_samples=1)
+            
+            # Append to the sequence
+            idx = torch.cat((idx, idx_next), dim=1)
+
+        return idx
