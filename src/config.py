@@ -19,6 +19,10 @@ class ModelArgs:
 
     rmsnorm_eps: float = 1e-6
 
+    init_mean: float = 0.0
+    init_std: float = 0.02
+    
+
     assert d_model%n_heads == 0
     assert (d_model / n_heads) % 2 == 0
     assert n_heads%n_kv_heads==0

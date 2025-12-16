@@ -32,7 +32,7 @@ class MoELayer(nn.Module):
 
         self.shared_experts = nn.ModuleList([MLP(args) for i in range(self.num_shared_experts)])
         self.experts = nn.ModuleList([MLP(args) for i in range(self.num_experts)])
-        self.router = nn.Linear(self.d_model, self.num_experts)
+        self.router = nn.Linear(self.d_model, self.num_experts, bias=False)
     
     def forward(self, x: torch.Tensor):
         # x shape: (batch_size, sequence_length, d_model)
@@ -218,6 +218,8 @@ class Transformer(nn.Module):
         self.vocab_size = args.vocab_size
         self.d_model = args.d_model
         self.n_layers = args.n_layers
+        self.init_mean = args.init_mean
+        self.init_std = args.init_std
 
         self.token_embeddings = nn.Embedding(self.vocab_size, self.d_model)
         
@@ -225,6 +227,20 @@ class Transformer(nn.Module):
         
         self.norm = RMSNorm(args)
         self.output = nn.Linear(self.d_model, self.vocab_size, bias=False)
+
+        self.output.weight = self.token_embeddings.weight
+
+        self.init_weights()
+
+    def init_weights(self):
+        for name, module in self.named_modules():
+            if isinstance(module, nn.Embedding):
+                nn.init.normal_(tensor=module.weight, mean=self.init_mean, std=self.init_std)
+            elif isinstance(module, nn.Linear):
+                if "router" in name:
+                    nn.init.normal_(tensor=module.weight, mean=self.init_mean, std=self.init_std)
+                else:
+                    nn.init.kaiming_normal_(tensor=module.weight, nonlinearity='relu')
 
     def forward(self, x: torch.Tensor, start_posn: int = 0, use_kv_cache: bool = False):
         # x shape: (batch_size, sequence_length)
