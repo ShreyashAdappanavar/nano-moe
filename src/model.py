@@ -42,16 +42,17 @@ class MoELayer(nn.Module):
         for i in self.shared_experts:
                 shared_exps_op.append(i(x))
 
-        logits = F.softmax(self.router(x), dim=-1)
-        topk = torch.topk(logits, self.top_k) # .values and .indices : (batch_size, sequence_length, top_k)
+        logits = self.router(x) # (batch_size, sequence_length, num_experts)
+        sf_max_logits = F.softmax(logits, dim=-1) # (batch_size, sequence_length, num_experts)
+        topk = torch.topk(sf_max_logits, self.top_k) # .values and .indices : (batch_size, sequence_length, top_k)
         weights = topk.values # (batch_size, sequence_length, top_k)
         indices = topk.indices # (batch_size, sequence_length, top_k)
 
         weights = weights/torch.sum(weights, dim=-1, keepdim=True)
 
-        x_flat = x.view(batch_size * sequence_length, self.d_model) # (batch_size * sequence_length, d_model)
-        weights = weights.view(batch_size * sequence_length, self.top_k) # (batch_size * sequence_length, top_k)
-        indices = indices.view(batch_size * sequence_length, self.top_k) # (batch_size * sequence_length, top_k)
+        x_flat = x.contiguous().view(batch_size * sequence_length, self.d_model) # (batch_size * sequence_length, d_model)
+        weights = weights.contiguous().view(batch_size * sequence_length, self.top_k) # (batch_size * sequence_length, top_k)
+        indices = indices.contiguous().view(batch_size * sequence_length, self.top_k) # (batch_size * sequence_length, top_k)
 
         routed_output = torch.zeros_like(x_flat) # (batch_size * sequence_length, d_model)
 
@@ -62,7 +63,7 @@ class MoELayer(nn.Module):
             curr_expert_op *= weights[row, index].unsqueeze(-1)
             routed_output[row] += curr_expert_op
             
-        routed_output = routed_output.view(batch_size, sequence_length, self.d_model)
+        routed_output = routed_output.contiguous().view(batch_size, sequence_length, self.d_model)
 
         # for i, curr_expert in enumerate(self.experts):
         #     mask = (indices==i) # (batch_size, sequence_length, top_k)
@@ -71,7 +72,7 @@ class MoELayer(nn.Module):
         #         cur_weights = weights * mask # Now the weight of the second chosen expert will be zero after multiplying it with mask
         #         routed_output += curr_expert(x) * torch.sum(cur_weights, dim=-1, keepdim=True)
                 
-        final_op = sum(shared_exps_op) + routed_output
+        final_op = routed_output + sum(shared_exps_op) / max(1, self.num_shared_experts) 
         return final_op, logits
     
 class CausalSelfAttention(nn.Module):
@@ -92,7 +93,7 @@ class CausalSelfAttention(nn.Module):
         self.c_proj = nn.Linear(self.d_model, self.d_model, bias=False)
 
         causal_mask = torch.triu(torch.full((self.max_seq_len, self.max_seq_len), float("-inf")), 
-                                 diagonal=1).view(1, 1, self.max_seq_len, self.max_seq_len).contiguous()
+                                 diagonal=1).contiguous().view(1, 1, self.max_seq_len, self.max_seq_len).contiguous()
         
         k_cache = torch.zeros((self.batch_size, self.max_seq_len, self.n_kv_heads, self.dk))
         v_cache = torch.zeros((self.batch_size, self.max_seq_len, self.n_kv_heads, self.dk))
@@ -102,7 +103,7 @@ class CausalSelfAttention(nn.Module):
 
         positions = torch.arange(self.max_seq_len, dtype=torch.float32) # (max_seq_len,)
 
-        angles = positions.view(len(positions), 1).contiguous() @ frequencies.view(1, len(frequencies)).contiguous() # (max_seq_len, dk // 2)
+        angles = positions.contiguous().view(len(positions), 1).contiguous() @ frequencies.contiguous().view(1, len(frequencies)).contiguous() # (max_seq_len, dk // 2)
 
         sin_matrix = torch.sin(angles) # (max_seq_len, dk // 2)
         cos_matrix = torch.cos(angles) # (max_seq_len, dk // 2)
@@ -114,82 +115,175 @@ class CausalSelfAttention(nn.Module):
         self.register_buffer("v_cache", v_cache, persistent=False)
 
     def forward(self, x: torch.Tensor, start_posn: int = 0, use_kv_cache: bool = False):
-        # x shape: (batch_size, curr_seq_length, d_model)
-        batch_size, curr_seq_len, _ = x.size()
-        
-        q = self.q_proj(x) # (batch_size, curr_seq_length, d_model)
-        k, v = self.kv_proj(x).split(self.n_kv_heads * self.dk, dim=-1) # (batch_size, curr_seq_length, n_kv_heads * dk)
+        # x: (B, T, D)
+        B, T, _ = x.size()
+        assert B <= self.batch_size
+        assert start_posn >= 0
+        assert start_posn + T <= self.max_seq_len   
+        dk = self.dk
+        H = self.n_heads
+        HKV = self.n_kv_heads
+        rep = H // HKV
 
-        q = q.view(batch_size, curr_seq_len, self.n_heads, self.dk).transpose(1,2) # (batch_size, n_heads, curr_seq_length, dk)
-        k = k.view(batch_size, curr_seq_len, self.n_kv_heads, self.dk).transpose(1,2) # (batch_size, n_kv_heads, curr_seq_length, dk) 
-        v = v.view(batch_size, curr_seq_len, self.n_kv_heads, self.dk).transpose(1,2) # (batch_size, n_kv_heads, curr_seq_length, dk)
+        q = self.q_proj(x)  # (B, T, D)
+        k, v = self.kv_proj(x).split(HKV * dk, dim=-1)  # (B, T, HKV*dk), (B, T, HKV*dk)
 
-        # k = k.repeat_interleave(self.n_heads//self.n_kv_heads, dim=1) # (batch_size, n_heads, curr_seq_length, dk) 
-        # v = v.repeat_interleave(self.n_heads//self.n_kv_heads, dim=1) # (batch_size, n_heads, curr_seq_length, dk) 
-        
-        cos_angles = self.cos_matrix[start_posn : start_posn + curr_seq_len, :].unsqueeze(0).unsqueeze(0) # type: ignore[attr-defined] # (1, 1, curr_seq_len, dk // 2)
-        sin_angles = self.sin_matrix[start_posn : start_posn + curr_seq_len, :].unsqueeze(0).unsqueeze(0) # type: ignore[attr-defined] # (1, 1, curr_seq_len, dk // 2)
+        q = q.contiguous().view(B, T, H, dk).transpose(1, 2).contiguous()      # (B, H,   T, dk)
+        k = k.contiguous().view(B, T, HKV, dk).transpose(1, 2).contiguous()    # (B, HKV, T, dk)
+        v = v.contiguous().view(B, T, HKV, dk).transpose(1, 2).contiguous()    # (B, HKV, T, dk)
 
-        q_even = q[:, :, :, 0::2] # (batch_size, n_heads, curr_seq_length, dk//2)
-        q_odd = q[:, :, :, 1::2] # (batch_size, n_heads, curr_seq_length, dk//2)
+        # RoPE (keep dtype consistent)
+        cos = self.cos_matrix[start_posn:start_posn + T].to(dtype=x.dtype, device=x.device).unsqueeze(0).unsqueeze(0)  # (1,1,T,dk/2)
+        sin = self.sin_matrix[start_posn:start_posn + T].to(dtype=x.dtype, device=x.device).unsqueeze(0).unsqueeze(0)
 
-        k_even = k[:, :, :, 0::2] # (batch_size, n_kv_heads, curr_seq_length, dk//2)
-        k_odd = k[:, :, :, 1::2] # (batch_size, n_kv_heads, curr_seq_length, dk//2)
+        def apply_rope(t, cos, sin):
+            t_even = t[..., 0::2]
+            t_odd  = t[..., 1::2]
+            out_even = t_even * cos - t_odd * sin
+            out_odd  = t_even * sin + t_odd * cos
+            out = torch.empty_like(t)
+            out[..., 0::2] = out_even
+            out[..., 1::2] = out_odd
+            return out
 
-        q_rotated_even = q_even*cos_angles - q_odd*sin_angles # (batch_size, n_heads, curr_seq_length, dk//2)
-        q_rotated_odd = q_even*sin_angles + q_odd*cos_angles # (batch_size, n_heads, curr_seq_length, dk//2)
-        
-        k_rotated_even = k_even*cos_angles - k_odd*sin_angles # (batch_size, n_kv_heads, curr_seq_length, dk//2)
-        k_rotated_odd = k_even*sin_angles + k_odd*cos_angles # (batch_size, n_kv_heads, curr_seq_length, dk//2)
-
-        q_rotated = torch.zeros_like(q) # (batch_size, n_heads, curr_seq_length, dk)
-        k_rotated = torch.zeros_like(k) # (batch_size, n_kv_heads, curr_seq_length, dk)
-
-        q_rotated[:,:,:,0::2] = q_rotated_even # (batch_size, n_heads, curr_seq_length, dk)
-        q_rotated[:,:,:,1::2] = q_rotated_odd # (batch_size, n_heads, curr_seq_length, dk)
-
-        k_rotated[:,:,:,0::2] = k_rotated_even # (batch_size, n_kv_heads, curr_seq_length, dk)
-        k_rotated[:,:,:,1::2] = k_rotated_odd # (batch_size, n_kv_heads, curr_seq_length, dk)
-
+        q = apply_rope(q, cos, sin)  # (B, H,   T, dk)
+        k = apply_rope(k, cos, sin)  # (B, HKV, T, dk)
 
         if use_kv_cache:
-            # 1. Write to Cache (Transpose to match cache shape)
-            self.k_cache[:batch_size, start_posn : start_posn + curr_seq_len] = k_rotated.transpose(1, 2) # type:ignore (batch_size, curr_seq_length, n_kv_heads, dk)  
-            self.v_cache[:batch_size, start_posn : start_posn + curr_seq_len] = v.transpose(1, 2) # type:ignore (batch_size, curr_seq_length, n_kv_heads, dk)
+            # write current block into cache (cache stores HKV heads)
+            k_cache_block = k.transpose(1, 2).contiguous()  # (B, T, HKV, dk)
+            v_cache_block = v.transpose(1, 2).contiguous()  # (B, T, HKV, dk)
+            self.k_cache[:B, start_posn:start_posn + T] = k_cache_block
+            self.v_cache[:B, start_posn:start_posn + T] = v_cache_block
 
-            # 2. Read History (Retrieve full valid sequence)
-            k_final = self.k_cache[:batch_size, : start_posn + curr_seq_len] # type:ignore (batch_size, total_seq_len, n_kv_heads, dk)
-            v_final = self.v_cache[:batch_size, : start_posn + curr_seq_len] # type:ignore (batch_size, total_seq_len, n_kv_heads, dk)
+            total = start_posn + T
 
-            # 3. Transpose back for Attention
-            k_final = k_final.transpose(1, 2) # (batch_size, n_kv_heads, total_seq_len, dk)
-            v_final = v_final.transpose(1, 2) # (batch_size, n_kv_heads, total_seq_len, dk)
+            # read full history
+            k_ctx = self.k_cache[:B, :total].transpose(1, 2).contiguous()  # (B, HKV, total, dk)
+            v_ctx = self.v_cache[:B, :total].transpose(1, 2).contiguous()  # (B, HKV, total, dk)
 
-            # 4. Expand History (GQA)
-            k_final = k_final.repeat_interleave(self.n_heads // self.n_kv_heads, dim=1) # (batch_size, n_heads, total_seq_len, dk)
-            v_final = v_final.repeat_interleave(self.n_heads // self.n_kv_heads, dim=1) # (batch_size, n_heads, total_seq_len, dk)
+            # expand to H heads
+            k_ctx = k_ctx.repeat_interleave(rep, dim=1)  # (B, H, total, dk)
+            v_ctx = v_ctx.repeat_interleave(rep, dim=1)  # (B, H, total, dk)
 
-            # 5. Attention (No Mask needed)
-            logits = (q_rotated @ k_final.transpose(-1,-2)) / math.sqrt(self.dk) # (batch_size, n_heads, curr_seq_length, total_seq_len)
+            logits = (q @ k_ctx.transpose(-1, -2)) / math.sqrt(dk)  # (B, H, T, total)
+
+            # correct causal slice for absolute query positions
+            logits = logits + self.causal_mask[:, :, start_posn:start_posn + T, :total]
+
+            probs = logits.softmax(dim=-1)
+            out = probs @ v_ctx  # (B, H, T, dk)
 
         else:
-            # 1. Expand Local Tensors (GQA)
-            k_final = k_rotated.repeat_interleave(self.n_heads // self.n_kv_heads, dim=1) # (batch_size, n_heads, curr_seq_length, dk)
-            v_final = v.repeat_interleave(self.n_heads // self.n_kv_heads, dim=1) # (batch_size, n_heads, curr_seq_length, dk)
-            
-            # 2. Attention
-            logits = (q_rotated @ k_final.transpose(-1,-2)) / math.sqrt(self.dk) # (batch_size, n_heads, curr_seq_length, curr_seq_length)
-            
-            # 3. Apply Mask
-            logits += self.causal_mask[:, :, :curr_seq_len, :curr_seq_len] # type:ignore (batch_size, n_heads, curr_seq_length, curr_seq_length)
+            # local attention (no cache)
+            k_ctx = k.repeat_interleave(rep, dim=1)  # (B, H, T, dk)
+            v_ctx = v.repeat_interleave(rep, dim=1)  # (B, H, T, dk)
 
-        # Final Aggregation (Shared)
-        probs = logits.softmax(dim=-1) # (batch_size, n_heads, curr_seq_length, total_seq_len OR curr_seq_length)
-        output = probs @ v_final # (batch_size, n_heads, curr_seq_length, dk)
+            logits = (q @ k_ctx.transpose(-1, -2)) / math.sqrt(dk)  # (B, H, T, T)
+            logits = logits + self.causal_mask[:, :, :T, :T]
+
+            probs = logits.softmax(dim=-1)
+            out = probs @ v_ctx  # (B, H, T, dk)
+
+        out = out.transpose(1, 2).contiguous().view(B, T, self.d_model)  # (B, T, D)
+        return self.c_proj(out)
+
+
+
+
+
+    # def forward(self, x: torch.Tensor, start_posn: int = 0, use_kv_cache: bool = False):
+    #     # x shape: (batch_size, curr_seq_length, d_model)
+    #     batch_size, curr_seq_len, _ = x.size()
         
-        output = output.transpose(1,2).contiguous().view(batch_size, curr_seq_len, self.d_model) # (batch_size, curr_seq_length, d_model)
+    #     q = self.q_proj(x) # (batch_size, curr_seq_length, d_model)
+    #     k, v = self.kv_proj(x).split(self.n_kv_heads * self.dk, dim=-1) # (batch_size, curr_seq_length, n_kv_heads * dk)
+
+    #     q = q.view(batch_size, curr_seq_len, self.n_heads, self.dk).transpose(1,2) # (batch_size, n_heads, curr_seq_length, dk)
+    #     k = k.view(batch_size, curr_seq_len, self.n_kv_heads, self.dk).transpose(1,2) # (batch_size, n_kv_heads, curr_seq_length, dk) 
+    #     v = v.view(batch_size, curr_seq_len, self.n_kv_heads, self.dk).transpose(1,2) # (batch_size, n_kv_heads, curr_seq_length, dk)
+
+    #     # k = k.repeat_interleave(self.n_heads//self.n_kv_heads, dim=1) # (batch_size, n_heads, curr_seq_length, dk) 
+    #     # v = v.repeat_interleave(self.n_heads//self.n_kv_heads, dim=1) # (batch_size, n_heads, curr_seq_length, dk) 
         
-        return self.c_proj(output)
+    #     cos_angles = self.cos_matrix[start_posn : start_posn + curr_seq_len, :].unsqueeze(0).unsqueeze(0) # type: ignore[attr-defined] # (1, 1, curr_seq_len, dk // 2)
+    #     sin_angles = self.sin_matrix[start_posn : start_posn + curr_seq_len, :].unsqueeze(0).unsqueeze(0) # type: ignore[attr-defined] # (1, 1, curr_seq_len, dk // 2)
+
+    #     q_even = q[:, :, :, 0::2] # (batch_size, n_heads, curr_seq_length, dk//2)
+    #     q_odd = q[:, :, :, 1::2] # (batch_size, n_heads, curr_seq_length, dk//2)
+
+    #     k_even = k[:, :, :, 0::2] # (batch_size, n_kv_heads, curr_seq_length, dk//2)
+    #     k_odd = k[:, :, :, 1::2] # (batch_size, n_kv_heads, curr_seq_length, dk//2)
+
+    #     q_rotated_even = q_even*cos_angles - q_odd*sin_angles # (batch_size, n_heads, curr_seq_length, dk//2)
+    #     q_rotated_odd = q_even*sin_angles + q_odd*cos_angles # (batch_size, n_heads, curr_seq_length, dk//2)
+        
+    #     k_rotated_even = k_even*cos_angles - k_odd*sin_angles # (batch_size, n_kv_heads, curr_seq_length, dk//2)
+    #     k_rotated_odd = k_even*sin_angles + k_odd*cos_angles # (batch_size, n_kv_heads, curr_seq_length, dk//2)
+
+    #     q_rotated = torch.zeros(q.shape, device=q.device, dtype=q.dtype) # (batch_size, n_heads, curr_seq_length, dk)
+    #     k_rotated = torch.zeros(k.shape, device=k.device, dtype=k.dtype) # (batch_size, n_kv_heads, curr_seq_length, dk)
+
+    #     # q_rotated = torch.zeros_like(q) # (batch_size, n_heads, curr_seq_length, dk)
+    #     # k_rotated = torch.zeros_like(k) # (batch_size, n_kv_heads, curr_seq_length, dk)
+
+    #     q_rotated[:,:,:,0::2] = q_rotated_even # (batch_size, n_heads, curr_seq_length, dk)
+    #     q_rotated[:,:,:,1::2] = q_rotated_odd # (batch_size, n_heads, curr_seq_length, dk)
+
+    #     k_rotated[:,:,:,0::2] = k_rotated_even # (batch_size, n_kv_heads, curr_seq_length, dk)
+    #     k_rotated[:,:,:,1::2] = k_rotated_odd # (batch_size, n_kv_heads, curr_seq_length, dk)
+
+    #     k_rotated = k_rotated.contiguous()
+
+    #     if use_kv_cache:
+    #         # 1. Write to Cache (Transpose to match cache shape)
+
+    #         k_to_cache = k_rotated.transpose(1, 2).contiguous()
+    #         v_to_cache = v.transpose(1, 2).contiguous()
+            
+    #         self.k_cache[:batch_size, start_posn : start_posn + curr_seq_len] = k_to_cache # type:ignore (batch_size, curr_seq_length, n_kv_heads, dk)  
+    #         self.v_cache[:batch_size, start_posn : start_posn + curr_seq_len] = v_to_cache # type:ignore (batch_size, curr_seq_length, n_kv_heads, dk)
+
+    #         # self.k_cache[:batch_size, start_posn : start_posn + curr_seq_len] = k_rotated.transpose(1, 2).contiguous() # type:ignore (batch_size, curr_seq_length, n_kv_heads, dk)  
+    #         # self.v_cache[:batch_size, start_posn : start_posn + curr_seq_len] = v.transpose(1, 2).contiguous() # type:ignore (batch_size, curr_seq_length, n_kv_heads, dk)
+
+    #         # 2. Read History (Retrieve full valid sequence)
+    #         k_final = self.k_cache[:batch_size, : start_posn + curr_seq_len] # type:ignore (batch_size, total_seq_len, n_kv_heads, dk)
+    #         v_final = self.v_cache[:batch_size, : start_posn + curr_seq_len] # type:ignore (batch_size, total_seq_len, n_kv_heads, dk)
+
+    #         # 3. Transpose back for Attention
+    #         k_final = k_final.transpose(1, 2).contiguous() # (batch_size, n_kv_heads, total_seq_len, dk)
+    #         v_final = v_final.transpose(1, 2).contiguous() # (batch_size, n_kv_heads, total_seq_len, dk)
+
+    #         # 4. Expand History (GQA)
+    #         k_final = k_final.repeat_interleave(self.n_heads // self.n_kv_heads, dim=1) # (batch_size, n_heads, total_seq_len, dk)
+    #         v_final = v_final.repeat_interleave(self.n_heads // self.n_kv_heads, dim=1) # (batch_size, n_heads, total_seq_len, dk)
+
+    #         # 5. Attention (No Mask needed)
+    #         total_seq_len = start_posn + curr_seq_len
+    #         logits = (q_rotated @ k_final.transpose(-1, -2)) / math.sqrt(self.dk)
+
+    #         # Correct mask slice for cached attention: (rows are absolute query positions)
+    #         logits += self.causal_mask[:, :, start_posn:start_posn + curr_seq_len, :total_seq_len] # type:ignore
+
+    #     else:
+    #         # 1. Expand Local Tensors (GQA)
+    #         k_final = k_rotated.repeat_interleave(self.n_heads // self.n_kv_heads, dim=1) # (batch_size, n_heads, curr_seq_length, dk)
+    #         v_final = v.repeat_interleave(self.n_heads // self.n_kv_heads, dim=1) # (batch_size, n_heads, curr_seq_length, dk)
+            
+    #         # 2. Attention
+    #         logits = (q_rotated @ k_final.transpose(-1,-2)) / math.sqrt(self.dk) # (batch_size, n_heads, curr_seq_length, curr_seq_length)
+            
+    #         # 3. Apply Mask
+    #         logits += self.causal_mask[:, :, :curr_seq_len, :curr_seq_len] # type:ignore (batch_size, n_heads, curr_seq_length, curr_seq_length)
+
+    #     # Final Aggregation (Shared)
+    #     probs = logits.softmax(dim=-1) # (batch_size, n_heads, curr_seq_length, total_seq_len OR curr_seq_length)
+    #     output = probs @ v_final # (batch_size, n_heads, curr_seq_length, dk)
+        
+    #     output = output.transpose(1,2).contiguous().view(batch_size, curr_seq_len, self.d_model) # (batch_size, curr_seq_length, d_model)
+        
+    #     return self.c_proj(output)
     
 
 class RMSNorm(nn.Module):
@@ -202,10 +296,9 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(self.d_model))
 
     def forward(self, x: torch.Tensor):
-        x /= torch.sqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
-        x = self.weight * x
-
-        return x
+        op = x / torch.sqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        op = self.weight * op
+        return op
     
 class TransformerBlock(nn.Module):
     def __init__(self, args: ModelArgs):
@@ -243,9 +336,11 @@ class Transformer(nn.Module):
         self.norm = RMSNorm(args)
         self.output = nn.Linear(self.d_model, self.vocab_size, bias=False)
 
+        self.init_weights()
+
         self.output.weight = self.token_embeddings.weight
 
-        self.init_weights()
+        
 
     def init_weights(self):
         for name, module in self.named_modules():
@@ -274,32 +369,81 @@ class Transformer(nn.Module):
 
     @torch.no_grad()
     def generate(self, idx: torch.Tensor, max_new_tokens: int, temperature: float = 1.0, use_kv_cache: bool = True):
-        # idx shape: (batch_size, sequence_length)
+        B, prompt_len = idx.shape
+        assert prompt_len <= self.layers[0].attention.max_seq_len
+        assert prompt_len + max_new_tokens <= self.layers[0].attention.max_seq_len
         
-        prompt_len = idx.shape[1]
+        if use_kv_cache:
+            for layer in self.layers:
+                layer.attention.k_cache.zero_()  # type: ignore
+                layer.attention.v_cache.zero_()  # type: ignore
 
-        for _ in range(max_new_tokens):
-           
-            if use_kv_cache and idx.shape[1] > prompt_len:
-                # Fast Mode: Only feed the last generated token
-                x_input = idx[:, -1:]
-                start_posn = idx.shape[1] - 1
+            # prefill cache with the full prompt
+            logits, _ = self(idx, start_posn=0, use_kv_cache=True)
+        else:
+            logits = None
+
+        for t in range(max_new_tokens):
+            if use_kv_cache:
+                if t == 0:
+                    # use logits from prefill
+                    next_logits = logits[:, -1, :] # type: ignore
+                else:
+                    # decode one token using cache
+                    start_posn = idx.shape[1] - 1
+                    logits_step, _ = self(idx[:, -1:], start_posn=start_posn, use_kv_cache=True)
+                    next_logits = logits_step[:, -1, :]
             else:
-                # Full Mode: Feed everything (Prefill or No-Cache)
-                x_input = idx
-                start_posn = 0
+                logits_full, _ = self(idx, start_posn=0, use_kv_cache=False)
+                next_logits = logits_full[:, -1, :]
 
-            # Forward pass
-            logits, _ = self(x_input, start_posn=start_posn, use_kv_cache=use_kv_cache)
-            
-            # Focus only on the last token's logits for prediction
-            logits = logits[:, -1, :] / temperature
-            
-            # Sample from the distribution
-            probs = F.softmax(logits, dim=-1)
-            idx_next = torch.multinomial(probs, num_samples=1)
-            
-            # Append to the sequence
+            if temperature == 0.0:
+                idx_next = torch.argmax(next_logits, dim=-1, keepdim=True)  # (B, 1)
+            else:
+                next_logits = next_logits / temperature
+                probs = F.softmax(next_logits, dim=-1)
+                idx_next = torch.multinomial(probs, num_samples=1)          # (B, 1)
+ 
+ 
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
+
+
+
+
+    # @torch.no_grad()
+    # def generate(self, idx: torch.Tensor, max_new_tokens: int, temperature: float = 1.0, use_kv_cache: bool = True):
+    #     # idx shape: (batch_size, sequence_length)
+        
+    #     prompt_len = idx.shape[1]
+    #     if use_kv_cache:
+    #         for layer in self.layers:
+    #             layer.attention.k_cache.zero_() # type:ignore
+    #             layer.attention.v_cache.zero_() # type:ignore
+
+    #     for _ in range(max_new_tokens):
+           
+    #         if use_kv_cache and idx.shape[1] > prompt_len:
+    #             # Fast Mode: Only feed the last generated token
+    #             x_input = idx[:, -1:]
+    #             start_posn = idx.shape[1] - 1
+    #         else:
+    #             # Full Mode: Feed everything (Prefill or No-Cache)
+    #             x_input = idx
+    #             start_posn = 0
+
+    #         # Forward pass
+    #         logits, _ = self(x_input, start_posn=start_posn, use_kv_cache=use_kv_cache)
+            
+    #         # Focus only on the last token's logits for prediction
+    #         logits = logits[:, -1, :] / temperature
+            
+    #         # Sample from the distribution
+    #         probs = F.softmax(logits, dim=-1)
+    #         idx_next = torch.multinomial(probs, num_samples=1)
+            
+    #         # Append to the sequence
+    #         idx = torch.cat((idx, idx_next), dim=1)
+
+    #     return idx

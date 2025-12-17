@@ -21,8 +21,11 @@ class ModelArgs:
 
     init_mean: float = 0.0
     init_std: float = 0.02
-    
 
-    assert d_model%n_heads == 0
-    assert (d_model / n_heads) % 2 == 0
-    assert n_heads%n_kv_heads==0
+    def __post_init__(self):
+        assert self.d_model % self.n_heads == 0
+        assert (self.d_model // self.n_heads) % 2 == 0  # dk must be even for RoPE
+        assert self.n_heads % self.n_kv_heads == 0
+        assert self.top_k <= self.num_experts
+        assert self.num_experts > 0 and self.num_shared_experts >= 0
+        assert self.top_k >= 1
