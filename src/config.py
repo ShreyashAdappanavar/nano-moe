@@ -3,9 +3,9 @@ from dataclasses import dataclass
 @dataclass
 class ModelArgs:
     d_model: int = 256
-    hidden_dim: int = 512
-    n_layers: int = 4
-    n_heads: int = 4
+    hidden_dim: int = 1024
+    n_layers: int = 6
+    n_heads: int = 8
     vocab_size: int = 10_000
     
     num_experts: int = 8
@@ -13,7 +13,7 @@ class ModelArgs:
     top_k: int = 2
 
     n_kv_heads: int = 2
-    max_seq_len: int =  1024
+    max_seq_len: int =  512
     rope_theta: float = 10_000.0
     batch_size: int = 32
 

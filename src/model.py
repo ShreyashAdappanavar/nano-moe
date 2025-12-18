@@ -64,14 +64,7 @@ class MoELayer(nn.Module):
             routed_output[row] += curr_expert_op
             
         routed_output = routed_output.contiguous().view(batch_size, sequence_length, self.d_model)
-
-        # for i, curr_expert in enumerate(self.experts):
-        #     mask = (indices==i) # (batch_size, sequence_length, top_k)
-
-        #     if mask.any():
-        #         cur_weights = weights * mask # Now the weight of the second chosen expert will be zero after multiplying it with mask
-        #         routed_output += curr_expert(x) * torch.sum(cur_weights, dim=-1, keepdim=True)
-                
+              
         final_op = routed_output + sum(shared_exps_op) / max(1, self.num_shared_experts) 
         return final_op, logits
     
@@ -187,103 +180,6 @@ class CausalSelfAttention(nn.Module):
 
         out = out.transpose(1, 2).contiguous().view(B, T, self.d_model)  # (B, T, D)
         return self.c_proj(out)
-
-
-
-
-
-    # def forward(self, x: torch.Tensor, start_posn: int = 0, use_kv_cache: bool = False):
-    #     # x shape: (batch_size, curr_seq_length, d_model)
-    #     batch_size, curr_seq_len, _ = x.size()
-        
-    #     q = self.q_proj(x) # (batch_size, curr_seq_length, d_model)
-    #     k, v = self.kv_proj(x).split(self.n_kv_heads * self.dk, dim=-1) # (batch_size, curr_seq_length, n_kv_heads * dk)
-
-    #     q = q.view(batch_size, curr_seq_len, self.n_heads, self.dk).transpose(1,2) # (batch_size, n_heads, curr_seq_length, dk)
-    #     k = k.view(batch_size, curr_seq_len, self.n_kv_heads, self.dk).transpose(1,2) # (batch_size, n_kv_heads, curr_seq_length, dk) 
-    #     v = v.view(batch_size, curr_seq_len, self.n_kv_heads, self.dk).transpose(1,2) # (batch_size, n_kv_heads, curr_seq_length, dk)
-
-    #     # k = k.repeat_interleave(self.n_heads//self.n_kv_heads, dim=1) # (batch_size, n_heads, curr_seq_length, dk) 
-    #     # v = v.repeat_interleave(self.n_heads//self.n_kv_heads, dim=1) # (batch_size, n_heads, curr_seq_length, dk) 
-        
-    #     cos_angles = self.cos_matrix[start_posn : start_posn + curr_seq_len, :].unsqueeze(0).unsqueeze(0) # type: ignore[attr-defined] # (1, 1, curr_seq_len, dk // 2)
-    #     sin_angles = self.sin_matrix[start_posn : start_posn + curr_seq_len, :].unsqueeze(0).unsqueeze(0) # type: ignore[attr-defined] # (1, 1, curr_seq_len, dk // 2)
-
-    #     q_even = q[:, :, :, 0::2] # (batch_size, n_heads, curr_seq_length, dk//2)
-    #     q_odd = q[:, :, :, 1::2] # (batch_size, n_heads, curr_seq_length, dk//2)
-
-    #     k_even = k[:, :, :, 0::2] # (batch_size, n_kv_heads, curr_seq_length, dk//2)
-    #     k_odd = k[:, :, :, 1::2] # (batch_size, n_kv_heads, curr_seq_length, dk//2)
-
-    #     q_rotated_even = q_even*cos_angles - q_odd*sin_angles # (batch_size, n_heads, curr_seq_length, dk//2)
-    #     q_rotated_odd = q_even*sin_angles + q_odd*cos_angles # (batch_size, n_heads, curr_seq_length, dk//2)
-        
-    #     k_rotated_even = k_even*cos_angles - k_odd*sin_angles # (batch_size, n_kv_heads, curr_seq_length, dk//2)
-    #     k_rotated_odd = k_even*sin_angles + k_odd*cos_angles # (batch_size, n_kv_heads, curr_seq_length, dk//2)
-
-    #     q_rotated = torch.zeros(q.shape, device=q.device, dtype=q.dtype) # (batch_size, n_heads, curr_seq_length, dk)
-    #     k_rotated = torch.zeros(k.shape, device=k.device, dtype=k.dtype) # (batch_size, n_kv_heads, curr_seq_length, dk)
-
-    #     # q_rotated = torch.zeros_like(q) # (batch_size, n_heads, curr_seq_length, dk)
-    #     # k_rotated = torch.zeros_like(k) # (batch_size, n_kv_heads, curr_seq_length, dk)
-
-    #     q_rotated[:,:,:,0::2] = q_rotated_even # (batch_size, n_heads, curr_seq_length, dk)
-    #     q_rotated[:,:,:,1::2] = q_rotated_odd # (batch_size, n_heads, curr_seq_length, dk)
-
-    #     k_rotated[:,:,:,0::2] = k_rotated_even # (batch_size, n_kv_heads, curr_seq_length, dk)
-    #     k_rotated[:,:,:,1::2] = k_rotated_odd # (batch_size, n_kv_heads, curr_seq_length, dk)
-
-    #     k_rotated = k_rotated.contiguous()
-
-    #     if use_kv_cache:
-    #         # 1. Write to Cache (Transpose to match cache shape)
-
-    #         k_to_cache = k_rotated.transpose(1, 2).contiguous()
-    #         v_to_cache = v.transpose(1, 2).contiguous()
-            
-    #         self.k_cache[:batch_size, start_posn : start_posn + curr_seq_len] = k_to_cache # type:ignore (batch_size, curr_seq_length, n_kv_heads, dk)  
-    #         self.v_cache[:batch_size, start_posn : start_posn + curr_seq_len] = v_to_cache # type:ignore (batch_size, curr_seq_length, n_kv_heads, dk)
-
-    #         # self.k_cache[:batch_size, start_posn : start_posn + curr_seq_len] = k_rotated.transpose(1, 2).contiguous() # type:ignore (batch_size, curr_seq_length, n_kv_heads, dk)  
-    #         # self.v_cache[:batch_size, start_posn : start_posn + curr_seq_len] = v.transpose(1, 2).contiguous() # type:ignore (batch_size, curr_seq_length, n_kv_heads, dk)
-
-    #         # 2. Read History (Retrieve full valid sequence)
-    #         k_final = self.k_cache[:batch_size, : start_posn + curr_seq_len] # type:ignore (batch_size, total_seq_len, n_kv_heads, dk)
-    #         v_final = self.v_cache[:batch_size, : start_posn + curr_seq_len] # type:ignore (batch_size, total_seq_len, n_kv_heads, dk)
-
-    #         # 3. Transpose back for Attention
-    #         k_final = k_final.transpose(1, 2).contiguous() # (batch_size, n_kv_heads, total_seq_len, dk)
-    #         v_final = v_final.transpose(1, 2).contiguous() # (batch_size, n_kv_heads, total_seq_len, dk)
-
-    #         # 4. Expand History (GQA)
-    #         k_final = k_final.repeat_interleave(self.n_heads // self.n_kv_heads, dim=1) # (batch_size, n_heads, total_seq_len, dk)
-    #         v_final = v_final.repeat_interleave(self.n_heads // self.n_kv_heads, dim=1) # (batch_size, n_heads, total_seq_len, dk)
-
-    #         # 5. Attention (No Mask needed)
-    #         total_seq_len = start_posn + curr_seq_len
-    #         logits = (q_rotated @ k_final.transpose(-1, -2)) / math.sqrt(self.dk)
-
-    #         # Correct mask slice for cached attention: (rows are absolute query positions)
-    #         logits += self.causal_mask[:, :, start_posn:start_posn + curr_seq_len, :total_seq_len] # type:ignore
-
-    #     else:
-    #         # 1. Expand Local Tensors (GQA)
-    #         k_final = k_rotated.repeat_interleave(self.n_heads // self.n_kv_heads, dim=1) # (batch_size, n_heads, curr_seq_length, dk)
-    #         v_final = v.repeat_interleave(self.n_heads // self.n_kv_heads, dim=1) # (batch_size, n_heads, curr_seq_length, dk)
-            
-    #         # 2. Attention
-    #         logits = (q_rotated @ k_final.transpose(-1,-2)) / math.sqrt(self.dk) # (batch_size, n_heads, curr_seq_length, curr_seq_length)
-            
-    #         # 3. Apply Mask
-    #         logits += self.causal_mask[:, :, :curr_seq_len, :curr_seq_len] # type:ignore (batch_size, n_heads, curr_seq_length, curr_seq_length)
-
-    #     # Final Aggregation (Shared)
-    #     probs = logits.softmax(dim=-1) # (batch_size, n_heads, curr_seq_length, total_seq_len OR curr_seq_length)
-    #     output = probs @ v_final # (batch_size, n_heads, curr_seq_length, dk)
-        
-    #     output = output.transpose(1,2).contiguous().view(batch_size, curr_seq_len, self.d_model) # (batch_size, curr_seq_length, d_model)
-        
-    #     return self.c_proj(output)
     
 
 class RMSNorm(nn.Module):
@@ -339,8 +235,6 @@ class Transformer(nn.Module):
         self.init_weights()
 
         self.output.weight = self.token_embeddings.weight
-
-        
 
     def init_weights(self):
         for name, module in self.named_modules():
@@ -408,42 +302,3 @@ class Transformer(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
-
-
-
-
-    # @torch.no_grad()
-    # def generate(self, idx: torch.Tensor, max_new_tokens: int, temperature: float = 1.0, use_kv_cache: bool = True):
-    #     # idx shape: (batch_size, sequence_length)
-        
-    #     prompt_len = idx.shape[1]
-    #     if use_kv_cache:
-    #         for layer in self.layers:
-    #             layer.attention.k_cache.zero_() # type:ignore
-    #             layer.attention.v_cache.zero_() # type:ignore
-
-    #     for _ in range(max_new_tokens):
-           
-    #         if use_kv_cache and idx.shape[1] > prompt_len:
-    #             # Fast Mode: Only feed the last generated token
-    #             x_input = idx[:, -1:]
-    #             start_posn = idx.shape[1] - 1
-    #         else:
-    #             # Full Mode: Feed everything (Prefill or No-Cache)
-    #             x_input = idx
-    #             start_posn = 0
-
-    #         # Forward pass
-    #         logits, _ = self(x_input, start_posn=start_posn, use_kv_cache=use_kv_cache)
-            
-    #         # Focus only on the last token's logits for prediction
-    #         logits = logits[:, -1, :] / temperature
-            
-    #         # Sample from the distribution
-    #         probs = F.softmax(logits, dim=-1)
-    #         idx_next = torch.multinomial(probs, num_samples=1)
-            
-    #         # Append to the sequence
-    #         idx = torch.cat((idx, idx_next), dim=1)
-
-    #     return idx
