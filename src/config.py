@@ -22,6 +22,8 @@ class ModelArgs:
     init_mean: float = 0.0
     init_std: float = 0.02
 
+    device: str = 'cuda'
+
     def __post_init__(self):
         assert self.d_model % self.n_heads == 0
         assert (self.d_model // self.n_heads) % 2 == 0  # dk must be even for RoPE
