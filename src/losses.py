@@ -74,8 +74,8 @@ def ce_loss_fn(logits: torch.Tensor, targets: torch.Tensor, args: ModelArgs):
 
     return ce_loss
 
-def compute_loss(logits: torch.Tensor, router_logits: List[torch.Tensor], targets: torch.Tensor, args: ModelArgs,
-                 alpha: float = 1e-2, beta: float = 1e-3, debug_flag: bool = False):
+def compute_loss(logits: torch.Tensor, router_logits: List[torch.Tensor], targets: torch.Tensor, 
+                 args: ModelArgs, debug_flag: bool = False):
        
     if not logits.is_contiguous(): logits = logits.contiguous()
 
@@ -86,7 +86,7 @@ def compute_loss(logits: torch.Tensor, router_logits: List[torch.Tensor], target
     
     else: Llb_final, Lz_final = router_loss(router_logits, args)
 
-    final_loss = ce_loss_final + alpha * Llb_final + beta * Lz_final
+    final_loss = ce_loss_final + args.alpha_lb * Llb_final + args.beta_z * Lz_final
 
     if debug_flag: 
         return_dict = {"all_importances": all_importances,

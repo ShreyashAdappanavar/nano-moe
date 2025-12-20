@@ -22,6 +22,25 @@ class ModelArgs:
     init_mean: float = 0.0
     init_std: float = 0.02
 
+    lr: float = 3e-4
+    weight_decay: float = 0.1
+    beta1: float = 0.9
+    beta2: float = 0.95
+    grad_clip_norm: float = 1.0
+
+    max_steps: int = 4_000
+    warmup_steps: int = 200
+    log_interval: int = 10
+    eval_interval: int = 200
+    eval_batches: int = 20
+    ckpt_interval: int = 500
+
+    alpha_lb: float = 1e-2
+    beta_z: float = 1e-3
+
+    seed: int = 1456
+    out_dir: str = "output"
+
     device: str = 'cuda'
 
     def __post_init__(self):

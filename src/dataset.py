@@ -18,9 +18,7 @@ val_path   = ROOT / "data" / "shards" / meta["files"]["val"]
 mm_train = np.memmap(train_path, dtype=np.uint16, mode="r")
 mm_val   = np.memmap(val_path,   dtype=np.uint16, mode="r")
 
-_rng = np.random.default_rng(1337)
-
-def get_batch(args: ModelArgs, split: str):
+def get_batch(args: ModelArgs, split: str, rng):
     assert split in ("train", "val")
     mm = mm_train if split == "train" else mm_val
 
@@ -32,7 +30,7 @@ def get_batch(args: ModelArgs, split: str):
     if N < L + 1:
         raise ValueError(f"{split}.bin too small: N={N}, need at least {L+1}")
 
-    starts = _rng.integers(0, N - L + 1, size=B)
+    starts = rng.integers(0, N - L + 1, size=B)
     idx2d = starts[:, None] + np.arange(L, dtype=np.int64)[None, :]
     chunk = mm[idx2d].astype(np.int64, copy=False)  # (B, L)
 
