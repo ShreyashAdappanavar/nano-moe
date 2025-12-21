@@ -75,6 +75,9 @@ tok = Tokenizer.from_file(tok_path)
 with META_PATH.open("r", encoding="utf-8") as f:
     meta = json.load(f)
 
+bos_id = int(meta["special_token_ids"]["[BOS]"])
+eos_id = int(meta["special_token_ids"]["[EOS]"])
+
 args = ModelArgs()
 assert args.vocab_size == meta["vocab_size"], "vocab_size in args and meta.json do not match"
 
@@ -91,6 +94,17 @@ with (out_path / "config.json").open("w", encoding="utf-8") as f:
 train_log_path = out_path / "train_log.jsonl"
 val_log_path   = out_path / "val_log.jsonl"
 load_log_path  = out_path / "load_log.jsonl"
+gen_log_path   = out_path / "gen_log.jsonl"
+
+def bos_align_prompt(x: torch.Tensor, bos_id: int, max_prompt_tokens: int = 256) -> torch.Tensor:
+    # x: (B, T) token ids
+    prompt = x[:1, :max_prompt_tokens]
+    p = prompt[0]
+    bos_pos = (p == bos_id).nonzero(as_tuple=True)[0]
+    if bos_pos.numel() > 0:
+        start = int(bos_pos[-1].item())
+        prompt = prompt[:, start:]
+    return prompt
 
 
 rng = np.random.default_rng(args.seed)
@@ -101,6 +115,39 @@ optimizer = AdamW(
     model.parameters(),
     lr=args.lr,
     weight_decay=args.weight_decay,
+    betas=(args.beta1, args.beta2),
+)
+
+# total trainable parameters
+n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+print("trainable_params:", n_trainable)
+
+# (optional) total parameters (trainable + frozen)
+n_total = sum(p.numel() for p in model.parameters())
+print("total_params:", n_total)
+
+decay_params = []
+nodecay_params = []
+for name, p in model.named_parameters():
+    if not p.requires_grad:
+        continue
+    if name == "token_embeddings.weight":
+        nodecay_params.append(p)
+    elif p.dim() < 2:
+        # biases + RMSNorm weights
+        nodecay_params.append(p)
+    elif "router" in name:
+        # optional but recommended for MoE stability
+        nodecay_params.append(p)
+    else:
+        decay_params.append(p)
+
+optimizer = AdamW(
+    [
+        {"params": decay_params, "weight_decay": args.weight_decay},
+        {"params": nodecay_params, "weight_decay": 0.0},
+    ],
+    lr=args.lr,
     betas=(args.beta1, args.beta2),
 )
 
@@ -161,9 +208,12 @@ for step in range(start_step, args.max_steps):
     loss.backward()
     grad = clip_grad_norm_(model.parameters(), args.grad_clip_norm)
 
+    min_lr = 0.1 * args.lr
     if step < args.warmup_steps:
-        lr_t = args.lr * (step + 1) / (args.warmup_steps) 
-    else: lr_t = args.lr
+        lr_t = args.lr * (step + 1) / args.warmup_steps
+    else:
+        progress = (step - args.warmup_steps) / max(1, (args.max_steps - args.warmup_steps))
+        lr_t = min_lr + 0.5 * (args.lr - min_lr) * (1.0 + np.cos(np.pi * progress))
 
     for group in optimizer.param_groups:
         group['lr'] = lr_t
@@ -207,7 +257,9 @@ for step in range(start_step, args.max_steps):
         print("========== EVAL STARTED ==========")
         val_rng = np.random.default_rng(args.seed + 10)
         with torch.no_grad():
-            _, dbg = compute_loss(logits, router_logits, y, args, debug_flag=True)
+            xv_dbg, yv_dbg = get_batch(args, split="val", rng=val_rng)
+            logits_dbg, router_logits_dbg = model(xv_dbg)
+            _, dbg = compute_loss(logits_dbg, router_logits_dbg, yv_dbg, args, debug_flag=True)
         all_loads = dbg["all_loads"]
         max_load_per_layer = all_loads.max(dim=-1).values.detach().float().cpu().numpy()
         load_steps.append(step)
@@ -225,6 +277,52 @@ for step in range(start_step, args.max_steps):
                 logits_v, _ = model(xv)
                 mean_ce += ce_loss_fn(logits_v, yv, args).item()
         mean_ce /= args.eval_batches
+
+
+        # Generation sanity check during eval (constant prompt across evals)
+        with torch.no_grad():
+            gen_rng = np.random.default_rng(args.seed + 999)
+            xg, _ = get_batch(args, split="val", rng=gen_rng)
+            prompt = bos_align_prompt(xg, bos_id, max_prompt_tokens=256)
+            out = model.generate(
+                prompt,
+                max_new_tokens=128,
+                temperature=0.0,
+                use_kv_cache=False,
+                eos_id=eos_id,
+                stop_on_eos=True,
+            )
+            prompt_ids = prompt[0].tolist()
+            out_ids = out[0].tolist()
+            prompt_text = tok.decode(prompt_ids)
+            gen_text = tok.decode(out_ids[len(prompt_ids):])
+
+        print("\n" + "-"*80)
+        print(f"EVAL GENERATION | step={step} | prompt=BOS-aligned | decode=greedy | eos_stop=on | kv_cache=off")
+        print("-"*80)
+        print("PROMPT:")
+        print(prompt_text)
+        print("\nGENERATION:")
+        print(gen_text)
+
+        append_jsonl(gen_log_path, {
+            "step": step,
+            "val_ce": float(mean_ce),
+            "prompt_ids": prompt_ids,
+            "gen_ids": out_ids[len(prompt_ids):],
+            "prompt_text": prompt_text,
+            "gen_text": gen_text,
+            "settings": {
+                "max_prompt_tokens": 256,
+                "max_new_tokens": 128,
+                "temperature": 0.0,
+                "use_kv_cache": False,
+                "eos_id": eos_id,
+                "stop_on_eos": True,
+            }
+        })
+
+
         append_jsonl(val_log_path, {
         "step": step,
         "val_ce": float(mean_ce),
@@ -249,13 +347,20 @@ print("\n" + "="*80)
 print("FINAL MODEL SANITY CHECK: 5 GENERATIONS")
 print("="*80)
 
+bos_id = int(meta["special_token_ids"]["[BOS]"])
+eos_id = int(meta["special_token_ids"]["[EOS]"])
+
 for i in range(5):
     rng_local = np.random.default_rng(args.seed + 10 + i)
 
     with torch.no_grad():
         x, _ = get_batch(args, split="val", rng=rng_local)
-        prompt = x[:1, :64]
-        out = model.generate(prompt, max_new_tokens=64, temperature=0.8, use_kv_cache=True)
+        prompt = bos_align_prompt(x, bos_id, max_prompt_tokens=256)
+
+        # Greedy + EOS stop (quality diagnostic)
+        out = model.generate(
+            prompt, max_new_tokens=128, temperature=0.0, use_kv_cache=False, eos_id=eos_id, stop_on_eos=True
+        )
 
     prompt_ids = prompt[0].tolist()
     out_ids = out[0].tolist()
@@ -264,7 +369,7 @@ for i in range(5):
     gen_text = tok.decode(out_ids[len(prompt_ids):])
 
     print("\n" + "-"*80)
-    print(f"SAMPLE {i+1}/5 | prompt_tokens=64 | gen_tokens=64 | temp=0.8 | kv_cache=on")
+    print(f"SAMPLE {i+1}/5 | prompt=BOS-aligned | decode=greedy | eos_stop=on | kv_cache=off")
     print("-"*80)
     print("PROMPT:")
     print(prompt_text)

@@ -262,7 +262,15 @@ class Transformer(nn.Module):
         return self.output(h), all_router_logits
 
     @torch.no_grad()
-    def generate(self, idx: torch.Tensor, max_new_tokens: int, temperature: float = 1.0, use_kv_cache: bool = True):
+    def generate(
+        self,
+        idx: torch.Tensor,
+        max_new_tokens: int,
+        temperature: float = 1.0,
+        use_kv_cache: bool = True,
+        eos_id: int | None = None,
+        stop_on_eos: bool = True,
+    ):
         B, prompt_len = idx.shape
         assert prompt_len <= self.layers[0].attention.max_seq_len
         assert prompt_len + max_new_tokens <= self.layers[0].attention.max_seq_len
@@ -276,6 +284,8 @@ class Transformer(nn.Module):
             logits, _ = self(idx, start_posn=0, use_kv_cache=True)
         else:
             logits = None
+
+        finished = torch.zeros((B,), device=idx.device, dtype=torch.bool)
 
         for t in range(max_new_tokens):
             if use_kv_cache:
@@ -297,8 +307,20 @@ class Transformer(nn.Module):
                 next_logits = next_logits / temperature
                 probs = F.softmax(next_logits, dim=-1)
                 idx_next = torch.multinomial(probs, num_samples=1)          # (B, 1)
- 
- 
+
+            if eos_id is not None:
+                # keep emitting EOS after first EOS to avoid continuing nonsense
+                idx_next = torch.where(
+                    finished.view(B, 1),
+                    torch.full_like(idx_next, eos_id),
+                    idx_next,
+                )
+
             idx = torch.cat((idx, idx_next), dim=1)
 
+            if eos_id is not None:
+                finished |= (idx_next.view(B) == eos_id)
+                if stop_on_eos and bool(finished.all()):
+                    break
+                
         return idx
