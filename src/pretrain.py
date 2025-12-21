@@ -346,3 +346,41 @@ if len(load_steps) > 0:
     plt.tight_layout()
     plt.savefig(out_path / "max_load_by_layer.png", dpi=150)
     plt.close()
+
+plt.figure()
+plt.plot(train_steps, [train_map[s]["ce"] for s in train_steps],  label="ce")
+plt.plot(train_steps, [train_map[s]["llb"] for s in train_steps], label="llb")
+plt.plot(train_steps, [train_map[s]["lz"] for s in train_steps],  label="lz")
+plt.xlabel("step")
+plt.ylabel("loss_component")
+plt.legend()
+plt.tight_layout()
+plt.savefig(out_path / "loss_components.png", dpi=150)
+plt.close()
+
+plt.figure()
+plt.plot(train_steps, [train_map[s].get("grad", 0.0) for s in train_steps])
+plt.xlabel("step")
+plt.ylabel("grad_norm")
+plt.tight_layout()
+plt.savefig(out_path / "grad_norm.png", dpi=150)
+plt.close()
+
+import bisect
+g_steps = []
+g_vals = []
+for vs in val_steps:
+    i = bisect.bisect_right(train_steps, vs) - 1
+    if i < 0:
+        continue
+    g_steps.append(vs)
+    g_vals.append(val_map[vs]["val_ce"] - train_map[train_steps[i]]["ce"])
+
+if len(g_steps) > 0:
+    plt.figure()
+    plt.plot(g_steps, g_vals)
+    plt.xlabel("step")
+    plt.ylabel("val_ce - train_ce")
+    plt.tight_layout()
+    plt.savefig(out_path / "generalization_gap.png", dpi=150)
+    plt.close()

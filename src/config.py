@@ -37,14 +37,14 @@ class ModelArgs:
     grad_clip_norm: float = 1.0
 
     # max_steps: int = 4_000
-    max_steps: int = 1000
+    max_steps: int = 5000
     warmup_steps: int = 200
     log_interval: int = 10
     # eval_interval: int = 200
-    eval_interval: int = 50
+    eval_interval: int = 200
     eval_batches: int = 20
     # ckpt_interval: int = 500
-    ckpt_interval: int = 250
+    ckpt_interval: int = 200
 
 
     alpha_lb: float = 1e-2
