@@ -190,7 +190,7 @@ best_step = -1
 model.train()
 
 training_ran = False 
-
+ema_dt = None
 for step in range(start_step, args.max_steps):
 # for step in range(start_step, start_step+30):
 
@@ -199,6 +199,7 @@ for step in range(start_step, args.max_steps):
         torch.cuda.reset_peak_memory_stats()
 
     training_ran = True
+
     x, y = get_batch(args, split="train", rng=rng)
     logits, router_logits = model(x)
 
@@ -221,6 +222,7 @@ for step in range(start_step, args.max_steps):
     optimizer.step()
 
     dt = time.perf_counter() - t0
+    ema_dt = dt if ema_dt is None else 0.98 * ema_dt + 0.02 * dt
     tokens_per_step = args.batch_size * args.max_seq_len
     tps = tokens_per_step / max(dt, 1e-9)
 
@@ -238,7 +240,8 @@ for step in range(start_step, args.max_steps):
         print(
             f"STEP: {step} | Loss: {loss.item():.3f} | CE_Loss: {logs['ce_loss']:.3f} | "
             f"Load_Balancing Loss: {logs['Llb_final']:.3f} | Z_Loss: {logs['Lz_final']:.3f} | "
-            f"Grad_Norm: {float(grad):.3f} | LR: {lr_t:.2e} | TPS: {tps:.0f} | MEM(MB): {train_mem_mb[-1]:.0f}"            
+            f"Grad_Norm: {float(grad):.3f} | LR: {lr_t:.2e} | TPS: {tps:.0f} | MEM(MB): {train_mem_mb[-1]:.0f}"        
+            f" | ETA(h): {((args.max_steps - step - 1) * ema_dt) / 3600:.2f}"    
         )
 
         append_jsonl(train_log_path, {
@@ -287,7 +290,7 @@ for step in range(start_step, args.max_steps):
             out = model.generate(
                 prompt,
                 max_new_tokens=128,
-                temperature=0.0,
+                temperature=0.8,
                 use_kv_cache=False,
                 eos_id=eos_id,
                 stop_on_eos=True,
@@ -315,7 +318,7 @@ for step in range(start_step, args.max_steps):
             "settings": {
                 "max_prompt_tokens": 256,
                 "max_new_tokens": 128,
-                "temperature": 0.0,
+                "temperature": 0.8,
                 "use_kv_cache": False,
                 "eos_id": eos_id,
                 "stop_on_eos": True,
@@ -359,7 +362,7 @@ for i in range(5):
 
         # Greedy + EOS stop (quality diagnostic)
         out = model.generate(
-            prompt, max_new_tokens=128, temperature=0.0, use_kv_cache=False, eos_id=eos_id, stop_on_eos=True
+            prompt, max_new_tokens=128, temperature=0.8, use_kv_cache=False, eos_id=eos_id, stop_on_eos=True
         )
 
     prompt_ids = prompt[0].tolist()
