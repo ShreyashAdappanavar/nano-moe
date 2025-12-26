@@ -1,7 +1,6 @@
 __pycache__/
 *.pt
 *.pth
-data/
 checkpoints/
 wandb/
 tests/
