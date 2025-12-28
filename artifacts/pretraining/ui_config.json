@@ -1,0 +1,17 @@
+{
+  "d_model": 192,
+  "hidden_dim": 512,
+  "n_layers": 6,
+  "n_heads": 8,
+  "vocab_size": 10000,
+  "num_experts": 4,
+  "num_shared_experts": 1,
+  "top_k": 2,
+  "n_kv_heads": 2,
+  "max_seq_len": 512,
+  "rope_theta": 10000.0,
+  "batch_size": 64,
+  "rmsnorm_eps": 1e-06,
+  "seed": 1456,
+  "device": "cuda"
+}

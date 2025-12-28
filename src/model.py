@@ -34,7 +34,7 @@ class MoELayer(nn.Module):
         self.experts = nn.ModuleList([MLP(args) for i in range(self.num_experts)])
         self.router = nn.Linear(self.d_model, self.num_experts, bias=False)
     
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor, trace: bool = False):
         # x shape: (batch_size, sequence_length, d_model)
         batch_size, sequence_length, _ = x.size()
 
@@ -44,11 +44,17 @@ class MoELayer(nn.Module):
 
         logits = self.router(x) # (batch_size, sequence_length, num_experts)
         sf_max_logits = F.softmax(logits, dim=-1) # (batch_size, sequence_length, num_experts)
-        topk = torch.topk(sf_max_logits, self.top_k) # .values and .indices : (batch_size, sequence_length, top_k)
+        topk = torch.topk(sf_max_logits, self.top_k, dim=-1) # .values and .indices : (batch_size, sequence_length, top_k)
         weights = topk.values # (batch_size, sequence_length, top_k)
         indices = topk.indices # (batch_size, sequence_length, top_k)
 
         weights = weights/torch.sum(weights, dim=-1, keepdim=True)
+
+        if trace:
+            if self.top_k>1: margin = topk.values[:,:,0] - topk.values[:,:,1]
+            else: margin = topk.values[:,:,0]
+
+            moe_trace = (topk.indices, weights, margin)
 
         x_flat = x.contiguous().view(batch_size * sequence_length, self.d_model) # (batch_size * sequence_length, d_model)
         weights = weights.contiguous().view(batch_size * sequence_length, self.top_k) # (batch_size * sequence_length, top_k)
@@ -66,7 +72,11 @@ class MoELayer(nn.Module):
         routed_output = routed_output.contiguous().view(batch_size, sequence_length, self.d_model)
               
         final_op = routed_output + sum(shared_exps_op) / max(1, self.num_shared_experts) 
-        return final_op, logits
+        
+        if trace:
+            return final_op, logits, moe_trace 
+        else:
+            return final_op, logits
     
 class CausalSelfAttention(nn.Module):
     def __init__(self, args: ModelArgs):
@@ -205,14 +215,19 @@ class TransformerBlock(nn.Module):
         self.attention_norm = RMSNorm(args)
         self.ff_norm = RMSNorm(args)
 
-    def forward(self, x: torch.Tensor, start_posn: int, use_kv_cache: bool):
+    def forward(self, x: torch.Tensor, start_posn: int, use_kv_cache: bool, trace: bool = False):
         # x shape: (batch_size, sequence_length, d_model)
 
         h = x + self.attention(self.attention_norm(x), start_posn, use_kv_cache)
-        moe_op, router_logits = self.feed_forward(self.ff_norm(h))
-        out = h + moe_op
-        
-        return out, router_logits
+
+        if trace:
+            moe_op, router_logits, moe_trace = self.feed_forward(self.ff_norm(h), trace=trace)
+            out = h + moe_op
+            return out, router_logits, moe_trace
+        else:
+            moe_op, router_logits = self.feed_forward(self.ff_norm(h), trace=trace)
+            out = h + moe_op
+            return out, router_logits
 
 
 class Transformer(nn.Module):
@@ -246,20 +261,27 @@ class Transformer(nn.Module):
                 else:
                     nn.init.kaiming_normal_(tensor=module.weight, nonlinearity='relu')
 
-    def forward(self, x: torch.Tensor, start_posn: int = 0, use_kv_cache: bool = False):
+    def forward(self, x: torch.Tensor, start_posn: int = 0, use_kv_cache: bool = False, trace: bool = False):
         # x shape: (batch_size, sequence_length)
 
         h = self.token_embeddings(x) # (batch_size, sequence_length, d_model)
 
         all_router_logits = []
-        for layer in self.layers:
-            op, router_logits = layer(h, start_posn, use_kv_cache)
+        for li, layer in enumerate(self.layers):
+            if (li == self.n_layers - 1) and trace:
+                op, router_logits, moe_trace = layer(h, start_posn, use_kv_cache, True)
+            else:
+                op, router_logits = layer(h, start_posn, use_kv_cache, False)
+
             all_router_logits.append(router_logits)
             h = op
 
         h = self.norm(h)
         
-        return self.output(h), all_router_logits
+        if trace:
+            return self.output(h), all_router_logits, moe_trace
+        else:
+            return self.output(h), all_router_logits
 
     @torch.no_grad()
     def generate(
@@ -270,57 +292,116 @@ class Transformer(nn.Module):
         use_kv_cache: bool = True,
         eos_id: int | None = None,
         stop_on_eos: bool = True,
+        trace: bool = False,
     ):
         B, prompt_len = idx.shape
         assert prompt_len <= self.layers[0].attention.max_seq_len
         assert prompt_len + max_new_tokens <= self.layers[0].attention.max_seq_len
-        
+
+        if trace:
+            assert B == 1, "trace=True currently supports B==1"
+            trace_token_ids: list[int] = []
+            trace_topk_idx: list[torch.Tensor] = []    # each: (K,)
+            trace_topk_w: list[torch.Tensor] = []      # each: (K,)
+            trace_margin: list[torch.Tensor] = []      # each: ()
+
         if use_kv_cache:
             for layer in self.layers:
                 layer.attention.k_cache.zero_()  # type: ignore
                 layer.attention.v_cache.zero_()  # type: ignore
 
-            # prefill cache with the full prompt
-            logits, _ = self(idx, start_posn=0, use_kv_cache=True)
+            # Prefill cache with full prompt
+            if trace:
+                logits, _, moe_trace = self(idx, start_posn=0, use_kv_cache=True, trace=True)
+                pre_idx, pre_w, pre_m = moe_trace  # (B,T,K), (B,T,K), (B,T)
+            else:
+                logits, _ = self(idx, start_posn=0, use_kv_cache=True, trace=False)
+                pre_idx = pre_w = pre_m = None
         else:
             logits = None
+            pre_idx = pre_w = pre_m = None
 
         finished = torch.zeros((B,), device=idx.device, dtype=torch.bool)
 
         for t in range(max_new_tokens):
             if use_kv_cache:
                 if t == 0:
-                    # use logits from prefill
-                    next_logits = logits[:, -1, :] # type: ignore
+                    # Use logits (and trace) from prefill prompt last position
+                    next_logits = logits[:, -1, :]  # type: ignore
+                    if trace:
+                        step_topk_idx = pre_idx[:, -1, :]  # type: ignore  # (1,K)
+                        step_topk_w   = pre_w[:, -1, :]    # type: ignore  # (1,K)
+                        step_margin   = pre_m[:, -1]       # type: ignore  # (1,)
                 else:
-                    # decode one token using cache
+                    # Decode one token using cache; position is absolute start_posn
                     start_posn = idx.shape[1] - 1
-                    logits_step, _ = self(idx[:, -1:], start_posn=start_posn, use_kv_cache=True)
+                    if trace:
+                        logits_step, _, moe_trace = self(
+                            idx[:, -1:], start_posn=start_posn, use_kv_cache=True, trace=True
+                        )
+                        st_idx, st_w, st_m = moe_trace  # (1,1,K), (1,1,K), (1,1)
+                        step_topk_idx = st_idx[:, 0, :]  # (1,K)
+                        step_topk_w   = st_w[:, 0, :]    # (1,K)
+                        step_margin   = st_m[:, 0]       # (1,)
+                    else:
+                        logits_step, _ = self(idx[:, -1:], start_posn=start_posn, use_kv_cache=True, trace=False)
                     next_logits = logits_step[:, -1, :]
             else:
-                logits_full, _ = self(idx, start_posn=0, use_kv_cache=False)
+                # No cache: full forward each step
+                if trace:
+                    logits_full, _, moe_trace = self(idx, start_posn=0, use_kv_cache=False, trace=True)
+                    st_idx, st_w, st_m = moe_trace  # (1,T,K), (1,T,K), (1,T)
+                    step_topk_idx = st_idx[:, -1, :]  # routing used to predict next token
+                    step_topk_w   = st_w[:, -1, :]
+                    step_margin   = st_m[:, -1]
+                else:
+                    logits_full, _ = self(idx, start_posn=0, use_kv_cache=False, trace=False)
                 next_logits = logits_full[:, -1, :]
 
+            # Sample next token
             if temperature == 0.0:
-                idx_next = torch.argmax(next_logits, dim=-1, keepdim=True)  # (B, 1)
+                idx_next = torch.argmax(next_logits, dim=-1, keepdim=True)  # (B,1)
             else:
                 next_logits = next_logits / temperature
                 probs = F.softmax(next_logits, dim=-1)
-                idx_next = torch.multinomial(probs, num_samples=1)          # (B, 1)
+                idx_next = torch.multinomial(probs, num_samples=1)          # (B,1)
 
             if eos_id is not None:
-                # keep emitting EOS after first EOS to avoid continuing nonsense
                 idx_next = torch.where(
                     finished.view(B, 1),
                     torch.full_like(idx_next, eos_id),
                     idx_next,
                 )
 
+            # Record trace for the token we are about to append (routing used to predict it)
+            if trace:
+                trace_token_ids.append(int(idx_next[0, 0].item()))
+                trace_topk_idx.append(step_topk_idx[0].detach().to("cpu"))  # (K,)
+                trace_topk_w.append(step_topk_w[0].detach().to("cpu"))      # (K,)
+                trace_margin.append(step_margin[0].detach().to("cpu"))      # ()
+
+            # Append
             idx = torch.cat((idx, idx_next), dim=1)
 
+            # EOS stopping
             if eos_id is not None:
                 finished |= (idx_next.view(B) == eos_id)
                 if stop_on_eos and bool(finished.all()):
                     break
-                
-        return idx
+
+        if not trace:
+            return idx
+
+        # Pack trace outputs: only generated tokens
+        topk_idx = torch.stack(trace_topk_idx, dim=0) if trace_topk_idx else torch.empty((0, self.layers[-1].feed_forward.top_k), dtype=torch.long)
+        topk_w   = torch.stack(trace_topk_w, dim=0)   if trace_topk_w   else torch.empty((0, self.layers[-1].feed_forward.top_k), dtype=torch.float32)
+        margin   = torch.stack(trace_margin, dim=0)   if trace_margin   else torch.empty((0,), dtype=torch.float32)
+
+        trace_out = {
+            "token_ids": trace_token_ids,  # len = gen_len
+            "topk_indices": topk_idx,      # (gen_len, K)
+            "topk_weights": topk_w,        # (gen_len, K)
+            "margin": margin,              # (gen_len,)
+            "note": "routing is taken from the position that predicted each generated token",
+        }
+        return idx, trace_out
