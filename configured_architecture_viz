@@ -1,0 +1,77 @@
+// Configured Transformer Architecture
+digraph {
+	nodesep=0.5 rankdir=TB ranksep=0.6 splines=ortho
+	node [fontname=Helvetica fontsize=12]
+	In [label="Input Embedding
+(D_Model: 192
+Vocab: 10k)" fillcolor="#E0E0E0" shape=invhouse style=filled]
+	subgraph cluster_block {
+		bgcolor="#FAFAFA" color="#555555" fontname="Helvetica-Bold" label="Transformer Block (x6 Layers)" style=dashed
+		LN1 [label="RMSNorm
+(eps: 1e-06)" fillcolor=white fontsize=10 style=filled]
+		subgraph cluster_attn {
+			bgcolor="#EDE7F6" color="#7E57C2" label="Causal Self-Attention
+(Heads: 8
+KV Heads: 2
+RoPE Theta: 10k)" style=rounded
+			QKV [label="Linear Projections
+Q: (B, T, 8, 24)
+KV: (B, T, 2, 24)" fillcolor=white fontsize=11 shape=box]
+			subgraph cluster_rope {
+				color="#5E35B1" label="Rotary Positional Embeddings" style=dashed
+				RoPE_Op [label="Rotate Q & K" fillcolor="#D1C4E9" shape=parallelogram]
+			}
+			subgraph cluster_cache {
+				color="#D84315" label="Inference Cache" style=bold
+				KVCache [label="KV Cache
+(Max Seq: 512
+Batch: 64)" fillcolor="#FFCCBC" shape=cylinder style=filled]
+				Concat [label=Concat shape=point]
+			}
+			AttnScore [label="Scaled Dot-Product
+(Grouped Query Attn)" fillcolor=white shape=box]
+			OProj [label="Output Projection
+(192 -> 192)" fillcolor=white shape=box]
+			QKV -> RoPE_Op [label="Q, K"]
+			QKV -> KVCache [label=V style=dashed]
+			RoPE_Op -> KVCache [label="Rotated K"]
+			RoPE_Op -> AttnScore [label=Q]
+			KVCache -> AttnScore [label="History K,V"]
+			AttnScore -> OProj
+		}
+		Add1 [label="+" fixedsize=true shape=circle width=0.3]
+		LN2 [label=RMSNorm fillcolor=white fontsize=10 style=filled]
+		subgraph cluster_moe {
+			bgcolor="#E3F2FD" color="#1E88E5" label="DeepSeek-Style MoE
+(Total Experts: 4
+Top-K: 2
+Hidden Dim: 512)" style=rounded
+			Router [label="Router
+(192 -> 4)" fillcolor="#FFAB91" shape=hexagon style=filled]
+			Shared [label="Shared Experts: 1
+(Always Active)" fillcolor="#C8E6C9" shape=box style=filled]
+			subgraph cluster_routed_ex {
+				label="Routed Experts" style=invis
+				Experts [label="Select Top-2 Experts
+(FFN: 192 -> 512 -> 192)" fillcolor="#FFF9C4" shape=box style=filled]
+			}
+			MoEAgg [label="Weighted Sum" fillcolor=white shape=diamond style=filled]
+			Router -> Experts [label="Softmax Weights" color="#E65100" fontsize=10]
+			Experts -> MoEAgg
+			Shared -> MoEAgg
+		}
+		Add2 [label="+" fixedsize=true shape=circle width=0.3]
+		LN1 -> QKV
+		OProj -> Add1
+		Add1 -> LN2
+		LN2 -> Router
+		LN2 -> Shared
+		MoEAgg -> Add2
+	}
+	In -> Add1 [label=residual style=dotted]
+	Add1 -> Add2 [label=residual style=dotted]
+	Out [label="Logits
+(vocab: 10000)" fillcolor="#E0E0E0" shape=oval style=filled]
+	Add2 -> Out
+	In -> LN1
+}
