@@ -347,7 +347,12 @@ with col_l:
     st.caption(f"Device: {device}")
 
 with col_r:
-    val = "Write a very short children's story.\n - Protagonist: a silly cat\n Style:\n - Simple words and short sentences.\n"
+    # val = "Write a very short children's story.\n - Protagonist: a silly cat\n Style:\n - Simple words and short sentences.\n"
+    val = (    "Write a very short children's story.\n\n"
+    "Constraints:\n"
+    f"- Protagonist: a cheerful dog\n"
+    "Style:\n"
+    "- Simple words and short sentences.\n")
     prompt = st.text_area("Prompt", value=val, height=140)
     c1, c2 = st.columns([1, 1])
     gen_btn = c1.button("Generate", use_container_width=True)

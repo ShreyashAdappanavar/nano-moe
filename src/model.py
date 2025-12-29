@@ -300,10 +300,10 @@ class Transformer(nn.Module):
 
         if trace:
             assert B == 1, "trace=True currently supports B==1"
-            trace_token_ids: list[int] = []
-            trace_topk_idx: list[torch.Tensor] = []    # each: (K,)
-            trace_topk_w: list[torch.Tensor] = []      # each: (K,)
-            trace_margin: list[torch.Tensor] = []      # each: ()
+            trace_token_ids= []
+            trace_topk_idx = []    # each: (K,)
+            trace_topk_w = []      # each: (K,)
+            trace_margin = []      # each: ()
 
         if use_kv_cache:
             for layer in self.layers:
