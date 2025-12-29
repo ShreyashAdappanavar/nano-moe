@@ -1,4 +1,3 @@
-# src/data.py
 import json
 from pathlib import Path
 
