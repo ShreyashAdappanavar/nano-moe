@@ -1,0 +1,4 @@
+streamlit==1.52.2
+torch==2.7.0
+tokenizers==0.22.1
+numpy
